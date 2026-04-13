@@ -1,0 +1,12 @@
+{
+  "name": "solana-wallet-tracker",
+  "version": "1.0.0",
+  "description": "Multi-wallet Solana tracker via WebSocket",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "ws": "8.18.0"
+  }
+}
