@@ -1,5 +1,5 @@
 // ============================================================
-//  SOLANA MULTI-WALLET TRACKER — FAST BOT (45s window)
+//  SOLANA MULTI-WALLET TRACKER — FAST BOT (60s window)
 //  Zero credits. No webhook provider. Runs forever for free.
 // ============================================================
 
@@ -15,9 +15,18 @@ const GMGN_API_KEY     = process.env.GMGN_API_KEY;
 const SHYFT_API_KEY    = process.env.SHYFT_API_KEY;
 
 const SOL_MINT         = 'So11111111111111111111111111111111111111112';
-const WINDOW_SECS      = 45;
+const WINDOW_SECS      = 60;
 const MAX_TOKEN_AGE    = 60;
 const STRICT_AGE_CHECK = true;
+
+// ── SIGNAL FILTER ─────────────────────────────────────────────
+// Signal fires if AT LEAST ONE condition is true:
+//   1. Same-name count >= 10  (fires regardless of dev info)
+//   2. Dev ATH >= $1,000,000  (only if dev wallet confirmed)
+//   3. Dev wallet is a tracked wallet  (only if dev wallet confirmed)
+// If dev wallet is unknown, only condition 1 can trigger a signal.
+const SAME_NAME_THRESHOLD = 10;
+const DEV_ATH_THRESHOLD   = 1_000_000;
 
 const WSS_PRIMARY  = SHYFT_API_KEY
   ? `wss://rpc.shyft.to?api_key=${SHYFT_API_KEY}`
@@ -117,10 +126,8 @@ let usingFallback  = false;
 let pendingSigs    = new Set();
 
 // ── UNIFIED TOKEN INFO CACHE ──────────────────────────────────
-// Guarantees at most ONE fetchTokenInfo call per mint, no matter
-// how many wallets buy the same token simultaneously.
-// Concurrent calls share the same in-flight promise instead of
-// each firing their own GMGN request — fixes 429 rate limiting.
+// Guarantees at most ONE fetchTokenInfo call per mint no matter
+// how many wallets buy simultaneously — fixes 429 rate limiting.
 let tokenInfoCache    = {};
 let tokenInfoInflight = {};
 
@@ -298,7 +305,7 @@ async function fetchSameNameCount(mint, symbol) {
     return ageSecs >= 0 && ageSecs <= cutoff;
   });
 
-  log(`[SameName] ${symbol}: ${matches.length} other tokens in last 5h (${data.pairs.length} total pairs returned)`);
+  log(`[SameName] ${symbol}: ${matches.length} other tokens in last 5h (${data.pairs.length} total pairs)`);
   return matches.length;
 }
 
@@ -306,7 +313,6 @@ async function getTokenAge(mint) {
   const now = Math.floor(Date.now() / 1000);
   if (skipCache[mint]) return -1;
   if (creationCache[mint]) return now - creationCache[mint];
-  // Use shared cache — no extra GMGN call if info already fetched
   const info = await getCachedTokenInfo(mint);
   if (!info) return null;
   const createdAt = info.creation_timestamp;
@@ -341,13 +347,42 @@ function sendTelegram(message) {
   req.end();
 }
 
+// ── SIGNAL FILTER ─────────────────────────────────────────────
+// Returns true if the signal should fire, false if it should be
+// suppressed. Logs the reason either way.
+function shouldFireSignal(tokenMint, symbol, sameNameCount, devWallet, devAthMc) {
+  const devIsTracked  = devWallet && devWallet !== 'unknown' && WALLET_SET.has(devWallet);
+  const devAthPasses  = devWallet && devWallet !== 'unknown' && devAthMc !== null && devAthMc >= DEV_ATH_THRESHOLD;
+  const sameNamePasses = sameNameCount !== null && sameNameCount >= SAME_NAME_THRESHOLD;
+
+  if (sameNamePasses) {
+    log(`[FILTER] ✅ PASS — same-name count ${sameNameCount} >= ${SAME_NAME_THRESHOLD}`);
+    return true;
+  }
+  if (devAthPasses) {
+    log(`[FILTER] ✅ PASS — dev ATH $${devAthMc.toLocaleString()} >= $${DEV_ATH_THRESHOLD.toLocaleString()}`);
+    return true;
+  }
+  if (devIsTracked) {
+    log(`[FILTER] ✅ PASS — dev wallet ${devWallet.substring(0, 8)} is a tracked wallet`);
+    return true;
+  }
+
+  // Log why it was suppressed
+  const snStr  = sameNameCount !== null ? sameNameCount : '?';
+  const athStr = devAthMc !== null ? `$${devAthMc.toLocaleString()}` : 'N/A';
+  const devStr = devWallet && devWallet !== 'unknown' ? devWallet.substring(0, 8) : 'unknown';
+  log(`[FILTER] ❌ SUPPRESSED #${symbol} — same-name: ${snStr}, dev ATH: ${athStr}, dev: ${devStr} (not tracked)`);
+  return false;
+}
+
 // ── SIGNAL ────────────────────────────────────────────────────
 async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo) {
   try {
     const now = Math.floor(Date.now() / 1000);
     let symbol = 'UNKNOWN', mintTimeStr = 'N/A', ageStr = 'N/A';
     let liquidityStr = 'N/A', marketCapStr = 'N/A';
-    let devWallet = 'N/A', devAth = 'N/A', devAthSymbol = '';
+    let devWallet = null, devAthMc = null, devAth = 'N/A', devAthSymbol = '';
     let freshWalletsFromInfo = null;
 
     if (tokenInfo) {
@@ -375,12 +410,13 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo) {
 
       const athInfo = tokenInfo.dev?.ath_token_info;
       if (athInfo?.ath_mc) {
-        const athMc = parseFloat(athInfo.ath_mc);
-        if (!isNaN(athMc)) {
+        const parsed = parseFloat(athInfo.ath_mc);
+        if (!isNaN(parsed)) {
+          devAthMc     = parsed;
           devAthSymbol = athInfo.symbol ? ` #${athInfo.symbol}` : '';
-          devAth = athMc >= 1_000_000
-            ? `$${(athMc / 1_000_000).toFixed(1)}M${devAthSymbol}`
-            : `$${athMc.toLocaleString('en-US', { maximumFractionDigits: 0 })}${devAthSymbol}`;
+          devAth       = parsed >= 1_000_000
+            ? `$${(parsed / 1_000_000).toFixed(1)}M${devAthSymbol}`
+            : `$${parsed.toLocaleString('en-US', { maximumFractionDigits: 0 })}${devAthSymbol}`;
         }
       }
 
@@ -388,6 +424,7 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo) {
       if (fwStat !== undefined && fwStat !== null) freshWalletsFromInfo = fwStat;
     }
 
+    // Fetch same-name count and fresh wallets in parallel
     const [sameNameCount, freshWalletsFromSecurity] = await Promise.all([
       fetchSameNameCount(tokenMint, symbol),
       freshWalletsFromInfo === null ? fetchFreshWallets(tokenMint) : Promise.resolve(null)
@@ -395,14 +432,19 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo) {
 
     const freshWallets = freshWalletsFromInfo ?? freshWalletsFromSecurity;
 
+    // ── APPLY SIGNAL FILTER ───────────────────────────────────
+    if (!shouldFireSignal(tokenMint, symbol, sameNameCount, devWallet, devAthMc)) {
+      return; // suppressed — conditions not met
+    }
+
     const signalTime = new Date().toLocaleTimeString('en-US', {
       timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true
     });
 
-    const devWalletLine = devWallet !== 'N/A' ? `<code>${devWallet}</code>` : 'N/A';
+    const devWalletLine = devWallet ? `<code>${devWallet}</code>` : 'N/A';
 
     sendTelegram(
-      `⚡ <b>3-Wallet Fast Signal (45s)</b>\n\n` +
+      `⚡ <b>3-Wallet Fast Signal (60s)</b>\n\n` +
       `Token: #${symbol}\n` +
       `Contract: <code>${tokenMint}</code>\n` +
       `Mint Time: ${mintTimeStr}\n` +
@@ -428,7 +470,7 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
     return;
   }
 
-  // Use shared cache for dev wallet check
+  // Fetch and cache dev wallet — reject buy if buyer IS the dev
   if (!devWalletCache[tokenMint]) {
     const devInfo = await getCachedTokenInfo(tokenMint);
     devWalletCache[tokenMint] = devInfo?.dev?.creator_address ?? 'unknown';
@@ -470,7 +512,6 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
     const elapsed = now - entry.firstSeenAt;
     saveFiredAlert(tokenMint);
     delete activeAlerts[tokenMint];
-    // Use shared cache for final signal fetch too
     const tokenInfo = await getCachedTokenInfo(tokenMint);
     await buildAndSendSignal(tokenMint, count, elapsed, tokenInfo);
   }
@@ -616,7 +657,7 @@ const server = http.createServer((req, res) => {
   const subCount = Object.keys(subIdToWallet).length;
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end(
-    `SOLANA FAST TRACKER (45s) — LIVE\n` +
+    `SOLANA FAST TRACKER (60s) — LIVE\n` +
     `WS: ${wsReady ? 'connected' : 'reconnecting'}\n` +
     `Subscriptions: ${subCount}/${WALLETS.length}\n` +
     `Fired alerts: ${firedAlerts.size}\n` +
@@ -629,7 +670,7 @@ server.listen(process.env.PORT || 3000, () => {
 });
 
 // ── START ─────────────────────────────────────────────────────
-log(`[START] Launching FAST tracker | ${WALLETS.length} wallets | 45s window | 60s max age | Active 11am-6pm ET`);
+log(`[START] Launching FAST tracker | ${WALLETS.length} wallets | 60s window | 60s max age | Active 11am-6pm ET`);
 log(`[START] WSS primary: ${WSS_PRIMARY.replace(/api_key=[^&]+/, 'api_key=***')}`);
 
 // ── OUTBOUND IP LOGGER ────────────────────────────────────────
