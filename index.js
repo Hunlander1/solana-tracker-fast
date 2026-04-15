@@ -1,44 +1,40 @@
 // ============================================================
-//  SOLANA MULTI-WALLET TRACKER — WEBSOCKET EDITION
+//  SOLANA MULTI-WALLET TRACKER — FAST BOT (45s window)
 //  Zero credits. No webhook provider. Runs forever for free.
 //
 //  How it works:
 //  - Opens a persistent WebSocket to a free Solana RPC
-//  - Subscribes to logsSubscribe for each of the 84 wallets
+//  - Subscribes to logsSubscribe for each wallet
 //  - When a wallet transacts, Solana pushes the signature
 //  - We fetch the full transaction to extract the token mint
 //  - Coordination logic + GMGN enrichment + Telegram signal
 //
 //  Render setup:
-//  - Change service type from "Web Service" to "Background Worker"
-//    (or keep as Web Service — the /health route keeps it alive)
 //  - Environment vars: TELEGRAM_TOKEN, CHAT_ID, GMGN_API_KEY,
-//                      SHYFT_API_KEY (your free Shyft key for WSS)
+//                      SHYFT_API_KEY, RENDER_EXTERNAL_URL
 // ============================================================
 
-const https   = require('https');
-const http    = require('http');
-const fs      = require('fs');
+const https     = require('https');
+const http      = require('http');
+const fs        = require('fs');
 const WebSocket = require('ws');
 
 // ── CONFIG ────────────────────────────────────────────────────
-const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
-const CHAT_ID        = process.env.CHAT_ID;
-const GMGN_API_KEY   = process.env.GMGN_API_KEY;
-const SHYFT_API_KEY  = process.env.SHYFT_API_KEY;  // free Shyft key for WSS
+const TELEGRAM_TOKEN   = process.env.TELEGRAM_TOKEN;
+const CHAT_ID          = process.env.CHAT_ID;
+const GMGN_API_KEY     = process.env.GMGN_API_KEY;
+const SHYFT_API_KEY    = process.env.SHYFT_API_KEY;
 
-const SOL_MINT     = 'So11111111111111111111111111111111111111112';
-const WINDOW_SECS    = 45;
-const MAX_TOKEN_AGE  = 60;   // token must be under 60s old at first buy
-const STRICT_AGE_CHECK = true; // reject if age unconfirmed — keeps fast bot clean // true = reject token if age can't be confirmed (use on fast bot)
+const SOL_MINT         = 'So11111111111111111111111111111111111111112';
+const WINDOW_SECS      = 45;
+const MAX_TOKEN_AGE    = 60;   // token must be under 60s old at first buy
+const STRICT_AGE_CHECK = true; // reject if age unconfirmed — keeps fast bot clean
 
-// WSS endpoints — primary is Shyft (free, unlimited RPC), fallback is public Solana
-// HTTP RPC for getTransaction calls
-const WSS_PRIMARY   = SHYFT_API_KEY
+const WSS_PRIMARY  = SHYFT_API_KEY
   ? `wss://rpc.shyft.to?api_key=${SHYFT_API_KEY}`
   : 'wss://api.mainnet-beta.solana.com';
-const WSS_FALLBACK  = 'wss://api.mainnet-beta.solana.com';
-const HTTP_RPC      = SHYFT_API_KEY
+const WSS_FALLBACK = 'wss://api.mainnet-beta.solana.com';
+const HTTP_RPC     = SHYFT_API_KEY
   ? `https://rpc.shyft.to?api_key=${SHYFT_API_KEY}`
   : 'https://api.mainnet-beta.solana.com';
 
@@ -114,21 +110,22 @@ const WALLETS = [
   "nazikTJezTC3W2fxXE3wzs495PYzXMiq5o7co6YYACA",  // YZY Dev
   "BtMBMPkoNbnLF9Xn552guQq528KKXcsNBNNBre3oaQtr", // Letterbomb(horse)
   "EYfdt8cNFyyTEJKp18dcoVbgUHDnM1SK3bT2uKj9XXHc", // Penguin Dev
+  "EgQX9R3Qph1dPHE1Ysou1auSYqRGomCNmLDC28Yg77aq", // Smart 8
 ];
 const WALLET_SET = new Set(WALLETS);
 
 // ── STATE ─────────────────────────────────────────────────────
-let firedAlerts     = loadFiredAlerts();
-let activeAlerts    = {};
-let devWalletCache  = {}; // tokenMint => creator_address (fast bot: skip dev buys)   // tokenMint => { wallets: Set, firstSeenAt }
-let creationCache = {};
-let skipCache     = {};
-let subIdToWallet = {};   // subscription id => wallet address
-let ws            = null;
-let wsReady       = false;
+let firedAlerts    = loadFiredAlerts();
+let activeAlerts   = {};
+let devWalletCache = {};
+let creationCache  = {};
+let skipCache      = {};
+let subIdToWallet  = {};
+let ws             = null;
+let wsReady        = false;
 let reconnectDelay = 5000;
 let usingFallback  = false;
-let pendingSigs    = new Set(); // debounce: avoid fetching same sig twice
+let pendingSigs    = new Set();
 
 log(`[INIT] Loaded ${firedAlerts.size} previously fired contracts`);
 
@@ -205,7 +202,6 @@ function httpsPost(url, body) {
 }
 
 // ── SOLANA RPC: getTransaction ────────────────────────────────
-// Called when a log notification arrives — fetches full tx to extract mint
 async function getTransaction(signature) {
   const result = await httpsPost(HTTP_RPC, {
     jsonrpc: '2.0',
@@ -229,7 +225,6 @@ function extractMint(tx) {
   const preBals  = meta.preTokenBalances  ?? [];
   const preOwned = new Set(preBals.map(b => b.mint));
 
-  // Prefer a mint that appeared in post but NOT in pre (newly received)
   let mint = postBals.find(b => b.mint && b.mint !== SOL_MINT && !preOwned.has(b.mint))?.mint;
   if (!mint) mint = postBals.find(b => b.mint && b.mint !== SOL_MINT)?.mint;
   return mint ?? null;
@@ -262,68 +257,46 @@ async function fetchFreshWallets(mint) {
   return data.fresh_holder_count ?? data.fresh_wallet_count ?? data.fresh_holders ?? data.freshHolder ?? null;
 }
 
-async function fetchSameNameCount(symbol) {
-  // Uses https.get which handles redirects automatically unlike https.request
-  log(`[Dex] Fetching same-name count for ${symbol}...`);
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const result = await new Promise((resolve) => {
-      const url = `https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(symbol)}`;
-      const req = https.get(url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-          'Accept': 'application/json',
-        }
-      }, (res) => {
-        log(`[Dex] HTTP ${res.statusCode} for ${symbol}`);
-        // https.get does NOT follow redirects — handle manually
-        if ([301, 302, 307, 308].includes(res.statusCode) && res.headers.location) {
-          res.resume(); // drain
-          const redirectReq = https.get(res.headers.location, {
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-              'Accept': 'application/json',
-            }
-          }, (res2) => {
-            let data = '';
-            res2.on('data', c => data += c);
-            res2.on('end', () => {
-              try { resolve(JSON.parse(data)); }
-              catch { log(`[Dex] Redirect parse fail: ${data.substring(0, 80)}`); resolve(null); }
-            });
-          });
-          redirectReq.on('error', (e) => { log(`[Dex] Redirect error: ${e.message}`); resolve(null); });
-          redirectReq.setTimeout(15000, () => { redirectReq.destroy(); resolve(null); });
-          return;
-        }
-        if (res.statusCode !== 200) { res.resume(); resolve(null); return; }
-        let data = '';
-        res.on('data', c => data += c);
-        res.on('end', () => {
-          try { resolve(JSON.parse(data)); }
-          catch { log(`[Dex] Parse fail: ${data.substring(0, 80)}`); resolve(null); }
-        });
-      });
-      req.on('error', (e) => { log(`[Dex] Error: ${e.message}`); resolve(null); });
-      req.setTimeout(15000, () => { req.destroy(); log(`[Dex] Timeout`); resolve(null); });
-    });
-
-    if (result) {
-      const pairs  = result.pairs ?? result.data ?? [];
-      const nowMs  = Date.now();
-      const cutoff = 5 * 3600 * 1000;
-      const count  = pairs.filter(p =>
-        (p.chainId === 'solana' || p.chain_id === 'solana') &&
-        (p.pairCreatedAt || p.pair_created_at) &&
-        nowMs - (p.pairCreatedAt ?? p.pair_created_at) <= cutoff
-      ).length;
-      log(`[Dex] ${symbol}: ${pairs.length} total pairs, ${count} Solana in 5h`);
-      return count;
-    }
-    log(`[Dex] attempt ${attempt + 1} got null for ${symbol}`);
-    if (attempt < 2) await new Promise(r => setTimeout(r, 3000));
+// ── SAME-NAME COUNT (DexScreener search by symbol from GMGN) ──
+//
+//  Symbol comes from GMGN tokenInfo — no extra API call needed.
+//  We search DexScreener for that symbol, count all OTHER Solana
+//  tokens with the exact same symbol created in the last 5 hours,
+//  and exclude our own mint from the count.
+//
+async function fetchSameNameCount(mint, symbol) {
+  if (!symbol || symbol === 'UNKNOWN') {
+    log(`[SameName] No symbol for ${mint.substring(0, 8)} — skipping`);
+    return null;
   }
-  log(`[Dex] All attempts failed for ${symbol}`);
-  return null;
+
+  log(`[SameName] Searching DexScreener for symbol: ${symbol}`);
+
+  const data = await httpsGet(
+    'api.dexscreener.com',
+    `/latest/dex/search?q=${encodeURIComponent(symbol)}`,
+    { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' }
+  );
+
+  if (!data?.pairs) {
+    log(`[SameName] No pairs returned from DexScreener for ${symbol}`);
+    return null;
+  }
+
+  const nowSecs = Math.floor(Date.now() / 1000);
+  const cutoff  = 5 * 3600;
+
+  const matches = data.pairs.filter(pair => {
+    if (pair.chainId !== 'solana') return false;
+    if (pair.baseToken?.symbol?.toUpperCase() !== symbol.toUpperCase()) return false;
+    if (pair.baseToken?.address === mint) return false; // exclude our own token
+    if (!pair.pairCreatedAt) return false;
+    const ageSecs = nowSecs - Math.floor(pair.pairCreatedAt / 1000);
+    return ageSecs >= 0 && ageSecs <= cutoff;
+  });
+
+  log(`[SameName] ${symbol}: ${matches.length} other tokens in last 5h (${data.pairs.length} total pairs returned)`);
+  return matches.length;
 }
 
 async function getTokenAge(mint) {
@@ -385,20 +358,17 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo) {
       }
       const liq = parseFloat(tokenInfo.liquidity);
       if (!isNaN(liq)) liquidityStr = `$${liq.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
-      // Market cap: try direct field first, then calculate from price × supply
       let mc = parseFloat(tokenInfo.market_cap ?? tokenInfo.usd_market_cap);
       if (isNaN(mc) || mc === 0) {
-        const price = parseFloat(tokenInfo.price);
+        const price  = parseFloat(tokenInfo.price);
         const supply = parseFloat(tokenInfo.circulating_supply ?? tokenInfo.total_supply);
         if (!isNaN(price) && !isNaN(supply) && price > 0 && supply > 0) mc = price * supply;
       }
       if (!isNaN(mc) && mc > 0) marketCapStr = `$${mc.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
 
-      // Dev wallet address
       const creatorAddr = tokenInfo.dev?.creator_address;
       if (creatorAddr) devWallet = creatorAddr;
 
-      // Dev all-time-high token
       const athInfo = tokenInfo.dev?.ath_token_info;
       if (athInfo?.ath_mc) {
         const athMc = parseFloat(athInfo.ath_mc);
@@ -410,14 +380,13 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo) {
         }
       }
 
-      // Fresh wallets — prefer wallet_tags_stat (already in token info, no extra call)
       const fwStat = tokenInfo.wallet_tags_stat?.fresh_wallets;
       if (fwStat !== undefined && fwStat !== null) freshWalletsFromInfo = fwStat;
     }
 
-    // Run same-name count and security fetch in parallel
+    // Symbol already in hand from tokenInfo — pass directly, no extra GMGN call
     const [sameNameCount, freshWalletsFromSecurity] = await Promise.all([
-      symbol !== 'UNKNOWN' ? fetchSameNameCount(symbol) : Promise.resolve(null),
+      fetchSameNameCount(tokenMint, symbol),
       freshWalletsFromInfo === null ? fetchFreshWallets(tokenMint) : Promise.resolve(null)
     ]);
 
@@ -427,7 +396,6 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo) {
       timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true
     });
 
-    // Full dev wallet as copyable code, with GMGN link
     const devWalletLine = devWallet !== 'N/A'
       ? `<code>${devWallet}</code>`
       : 'N/A';
@@ -459,7 +427,6 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
     return;
   }
 
-  // Check if buyer is the dev — don't count dev buys toward the 3
   if (!devWalletCache[tokenMint]) {
     const devInfo = await fetchTokenInfo(tokenMint);
     devWalletCache[tokenMint] = devInfo?.dev?.creator_address ?? 'unknown';
@@ -508,10 +475,8 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
 
 // ── PROCESS LOG NOTIFICATION ──────────────────────────────────
 async function processLogNotification(params) {
-  if (!isActiveHours()) return; // 11am-6pm ET only
+  if (!isActiveHours()) return;
 
-  // Solana logsNotification structure:
-  // params = { subscription: <subId>, result: { context: { slot }, value: { signature, err, logs } } }
   const value = params?.result?.value;
   const subId = params?.subscription;
 
@@ -520,16 +485,14 @@ async function processLogNotification(params) {
     return;
   }
 
-  // Skip failed transactions
   if (value.err !== null && value.err !== undefined) return;
 
-  const signature = value.signature;
+  const signature     = value.signature;
   const trackedWallet = subIdToWallet[subId];
 
   if (!trackedWallet) return;
   log(`[LOG HIT] wallet ${trackedWallet.substring(0, 8)} | sig ${signature.substring(0, 12)}...`);
 
-  // Debounce: same sig can fire for multiple wallet subs if two tracked wallets are in same tx
   if (pendingSigs.has(signature)) {
     log(`[DEBOUNCE] ${signature.substring(0, 12)} already being processed`);
     return;
@@ -537,7 +500,6 @@ async function processLogNotification(params) {
   pendingSigs.add(signature);
   setTimeout(() => pendingSigs.delete(signature), 30000);
 
-  // Fetch full transaction to extract the token mint
   let tx = null;
   for (let attempt = 0; attempt < 3; attempt++) {
     tx = await getTransaction(signature);
@@ -562,7 +524,7 @@ async function processLogNotification(params) {
 }
 
 // ── WEBSOCKET ─────────────────────────────────────────────────
-let reqIdToWallet = {};  // request id => wallet (set when we send subscribe)
+let reqIdToWallet = {};
 
 function connect(useUrl) {
   const url = useUrl ?? (usingFallback ? WSS_FALLBACK : WSS_PRIMARY);
@@ -578,7 +540,6 @@ function connect(useUrl) {
     wsReady = true;
     reconnectDelay = 5000;
 
-    // Build reqId→wallet map BEFORE sending, so order doesn't matter
     WALLETS.forEach((wallet, i) => {
       const reqId = i + 1;
       reqIdToWallet[reqId] = wallet;
@@ -595,7 +556,6 @@ function connect(useUrl) {
 
     log(`[WS] All ${WALLETS.length} subscription requests sent`);
 
-    // Ping every 30s to keep connection alive
     const pingInterval = setInterval(() => {
       if (ws.readyState === WebSocket.OPEN) {
         ws.ping();
@@ -610,8 +570,6 @@ function connect(useUrl) {
     try { msg = JSON.parse(data.toString()); }
     catch { return; }
 
-    // Subscription confirmation: Solana returns { id: <our req id>, result: <sub id> }
-    // Use reqIdToWallet (reliable) not array index (order-dependent)
     if (msg.id !== undefined && msg.result !== undefined && typeof msg.result === 'number' && !msg.method) {
       const wallet = reqIdToWallet[msg.id];
       if (wallet) {
@@ -623,9 +581,8 @@ function connect(useUrl) {
       return;
     }
 
-    // Log notification — log every single one so we know they're arriving
     if (msg.method === 'logsNotification') {
-      const subId = msg.params?.subscription;
+      const subId  = msg.params?.subscription;
       const wallet = subIdToWallet[subId];
       log(`[WS] logsNotification subId=${subId} mapped=${wallet ? wallet.substring(0,8) : 'UNKNOWN'}`);
       processLogNotification(msg.params).catch(e => log(`[ERR] processLogNotification: ${e.message}`));
@@ -640,7 +597,6 @@ function connect(useUrl) {
     wsReady = false;
     log(`[WS] Disconnected (code: ${code}). Reconnecting in ${reconnectDelay / 1000}s...`);
 
-    // Try fallback endpoint if primary keeps failing
     if (reconnectDelay >= 30000 && !usingFallback && WSS_PRIMARY !== WSS_FALLBACK) {
       log(`[WS] Switching to fallback endpoint`);
       usingFallback = true;
@@ -648,12 +604,11 @@ function connect(useUrl) {
     }
 
     setTimeout(() => connect(), reconnectDelay);
-    reconnectDelay = Math.min(reconnectDelay * 2, 60000); // exponential backoff, max 60s
+    reconnectDelay = Math.min(reconnectDelay * 2, 60000);
   });
 }
 
 // ── HEALTH CHECK SERVER ───────────────────────────────────────
-// Keeps Render from spinning down the service (free tier spins down on no HTTP traffic)
 const server = http.createServer((req, res) => {
   const subCount = Object.keys(subIdToWallet).length;
   res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -673,11 +628,25 @@ server.listen(process.env.PORT || 3000, () => {
 // ── START ─────────────────────────────────────────────────────
 log(`[START] Launching FAST tracker | ${WALLETS.length} wallets | 45s window | 60s max age | Active 11am-6pm ET`);
 log(`[START] WSS primary: ${WSS_PRIMARY.replace(/api_key=[^&]+/, 'api_key=***')}`);
+
+// ── OUTBOUND IP LOGGER ────────────────────────────────────────
+// Logs this Render service's outbound IP on startup so you can add it
+// to your GMGN API key's trusted IP list if GMGN calls are failing.
+// Safe to leave in permanently — runs once on startup, no overhead.
+https.get('https://api.ipify.org?format=json', (res) => {
+  let d = '';
+  res.on('data', c => d += c);
+  res.on('end', () => {
+    try {
+      const ip = JSON.parse(d).ip;
+      log(`[IP] Outbound IP: ${ip} — add this to GMGN trusted IPs if GMGN calls are failing`);
+    } catch { log(`[IP] Could not parse outbound IP response`); }
+  });
+}).on('error', (e) => log(`[IP] IP check failed: ${e.message}`));
+
 connect();
 
 // ── SELF-PING (keeps Render free tier from sleeping) ──────────
-// Render spins down free services after ~15min of no HTTP traffic.
-// We ping our own health endpoint every 10 minutes to stay awake.
 const RENDER_URL = process.env.RENDER_EXTERNAL_URL || null;
 setInterval(() => {
   if (!RENDER_URL) return;
@@ -691,4 +660,4 @@ setInterval(() => {
   } catch(e) {
     log(`[PING] Self-ping error: ${e.message}`);
   }
-}, 10 * 60 * 1000); // every 10 minutes
+}, 10 * 60 * 1000);
