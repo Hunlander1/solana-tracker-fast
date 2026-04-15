@@ -1,22 +1,11 @@
 // ============================================================
 //  SOLANA MULTI-WALLET TRACKER — FAST BOT (45s window)
 //  Zero credits. No webhook provider. Runs forever for free.
-//
-//  How it works:
-//  - Opens a persistent WebSocket to a free Solana RPC
-//  - Subscribes to logsSubscribe for each wallet
-//  - When a wallet transacts, Solana pushes the signature
-//  - We fetch the full transaction to extract the token mint
-//  - Coordination logic + GMGN enrichment + Telegram signal
-//
-//  Render setup:
-//  - Environment vars: TELEGRAM_TOKEN, CHAT_ID, GMGN_API_KEY,
-//                      SHYFT_API_KEY, RENDER_EXTERNAL_URL
 // ============================================================
 
-const https     = require('https');
-const http      = require('http');
-const fs        = require('fs');
+const https   = require('https');
+const http    = require('http');
+const fs      = require('fs');
 const WebSocket = require('ws');
 
 // ── CONFIG ────────────────────────────────────────────────────
@@ -27,8 +16,8 @@ const SHYFT_API_KEY    = process.env.SHYFT_API_KEY;
 
 const SOL_MINT         = 'So11111111111111111111111111111111111111112';
 const WINDOW_SECS      = 45;
-const MAX_TOKEN_AGE    = 60;   // token must be under 60s old at first buy
-const STRICT_AGE_CHECK = true; // reject if age unconfirmed — keeps fast bot clean
+const MAX_TOKEN_AGE    = 60;
+const STRICT_AGE_CHECK = true;
 
 const WSS_PRIMARY  = SHYFT_API_KEY
   ? `wss://rpc.shyft.to?api_key=${SHYFT_API_KEY}`
@@ -38,7 +27,7 @@ const HTTP_RPC     = SHYFT_API_KEY
   ? `https://rpc.shyft.to?api_key=${SHYFT_API_KEY}`
   : 'https://api.mainnet-beta.solana.com';
 
-// ── FIRED ALERTS (file-backed, survives restarts) ─────────────
+// ── FIRED ALERTS ──────────────────────────────────────────────
 const FIRED_FILE = '/tmp/fired_alerts.json';
 
 function loadFiredAlerts() {
@@ -126,6 +115,26 @@ let wsReady        = false;
 let reconnectDelay = 5000;
 let usingFallback  = false;
 let pendingSigs    = new Set();
+
+// ── UNIFIED TOKEN INFO CACHE ──────────────────────────────────
+// Guarantees at most ONE fetchTokenInfo call per mint, no matter
+// how many wallets buy the same token simultaneously.
+// Concurrent calls share the same in-flight promise instead of
+// each firing their own GMGN request — fixes 429 rate limiting.
+let tokenInfoCache    = {};
+let tokenInfoInflight = {};
+
+async function getCachedTokenInfo(mint) {
+  if (mint in tokenInfoCache) return tokenInfoCache[mint];
+  if (tokenInfoInflight[mint]) return tokenInfoInflight[mint];
+  tokenInfoInflight[mint] = fetchTokenInfo(mint).then(info => {
+    tokenInfoCache[mint] = info;
+    delete tokenInfoInflight[mint];
+    setTimeout(() => delete tokenInfoCache[mint], 600000);
+    return info;
+  });
+  return tokenInfoInflight[mint];
+}
 
 log(`[INIT] Loaded ${firedAlerts.size} previously fired contracts`);
 
@@ -257,13 +266,7 @@ async function fetchFreshWallets(mint) {
   return data.fresh_holder_count ?? data.fresh_wallet_count ?? data.fresh_holders ?? data.freshHolder ?? null;
 }
 
-// ── SAME-NAME COUNT (DexScreener search by symbol from GMGN) ──
-//
-//  Symbol comes from GMGN tokenInfo — no extra API call needed.
-//  We search DexScreener for that symbol, count all OTHER Solana
-//  tokens with the exact same symbol created in the last 5 hours,
-//  and exclude our own mint from the count.
-//
+// ── SAME-NAME COUNT ───────────────────────────────────────────
 async function fetchSameNameCount(mint, symbol) {
   if (!symbol || symbol === 'UNKNOWN') {
     log(`[SameName] No symbol for ${mint.substring(0, 8)} — skipping`);
@@ -289,7 +292,7 @@ async function fetchSameNameCount(mint, symbol) {
   const matches = data.pairs.filter(pair => {
     if (pair.chainId !== 'solana') return false;
     if (pair.baseToken?.symbol?.toUpperCase() !== symbol.toUpperCase()) return false;
-    if (pair.baseToken?.address === mint) return false; // exclude our own token
+    if (pair.baseToken?.address === mint) return false;
     if (!pair.pairCreatedAt) return false;
     const ageSecs = nowSecs - Math.floor(pair.pairCreatedAt / 1000);
     return ageSecs >= 0 && ageSecs <= cutoff;
@@ -303,7 +306,8 @@ async function getTokenAge(mint) {
   const now = Math.floor(Date.now() / 1000);
   if (skipCache[mint]) return -1;
   if (creationCache[mint]) return now - creationCache[mint];
-  const info = await fetchTokenInfo(mint);
+  // Use shared cache — no extra GMGN call if info already fetched
+  const info = await getCachedTokenInfo(mint);
   if (!info) return null;
   const createdAt = info.creation_timestamp;
   if (!createdAt) return null;
@@ -384,7 +388,6 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo) {
       if (fwStat !== undefined && fwStat !== null) freshWalletsFromInfo = fwStat;
     }
 
-    // Symbol already in hand from tokenInfo — pass directly, no extra GMGN call
     const [sameNameCount, freshWalletsFromSecurity] = await Promise.all([
       fetchSameNameCount(tokenMint, symbol),
       freshWalletsFromInfo === null ? fetchFreshWallets(tokenMint) : Promise.resolve(null)
@@ -396,9 +399,7 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo) {
       timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true
     });
 
-    const devWalletLine = devWallet !== 'N/A'
-      ? `<code>${devWallet}</code>`
-      : 'N/A';
+    const devWalletLine = devWallet !== 'N/A' ? `<code>${devWallet}</code>` : 'N/A';
 
     sendTelegram(
       `⚡ <b>3-Wallet Fast Signal (45s)</b>\n\n` +
@@ -427,8 +428,9 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
     return;
   }
 
+  // Use shared cache for dev wallet check
   if (!devWalletCache[tokenMint]) {
-    const devInfo = await fetchTokenInfo(tokenMint);
+    const devInfo = await getCachedTokenInfo(tokenMint);
     devWalletCache[tokenMint] = devInfo?.dev?.creator_address ?? 'unknown';
     setTimeout(() => delete devWalletCache[tokenMint], 600000);
   }
@@ -468,7 +470,8 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
     const elapsed = now - entry.firstSeenAt;
     saveFiredAlert(tokenMint);
     delete activeAlerts[tokenMint];
-    const tokenInfo = await fetchTokenInfo(tokenMint);
+    // Use shared cache for final signal fetch too
+    const tokenInfo = await getCachedTokenInfo(tokenMint);
     await buildAndSendSignal(tokenMint, count, elapsed, tokenInfo);
   }
 }
@@ -630,9 +633,6 @@ log(`[START] Launching FAST tracker | ${WALLETS.length} wallets | 45s window | 6
 log(`[START] WSS primary: ${WSS_PRIMARY.replace(/api_key=[^&]+/, 'api_key=***')}`);
 
 // ── OUTBOUND IP LOGGER ────────────────────────────────────────
-// Logs this Render service's outbound IP on startup so you can add it
-// to your GMGN API key's trusted IP list if GMGN calls are failing.
-// Safe to leave in permanently — runs once on startup, no overhead.
 https.get('https://api.ipify.org?format=json', (res) => {
   let d = '';
   res.on('data', c => d += c);
