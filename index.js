@@ -274,39 +274,80 @@ async function fetchFreshWallets(mint) {
 }
 
 // ── SAME-NAME COUNT ───────────────────────────────────────────
+// Uses https.get with manual redirect handling because DexScreener
+// issues 301/302 redirects that https.request does not follow.
 async function fetchSameNameCount(mint, symbol) {
   if (!symbol || symbol === 'UNKNOWN') {
     log(`[SameName] No symbol for ${mint.substring(0, 8)} — skipping`);
     return null;
   }
 
-  log(`[SameName] Searching DexScreener for symbol: ${symbol}`);
+  log(`[Dex] Fetching same-name count for ${symbol}...`);
 
-  const data = await httpsGet(
-    'api.dexscreener.com',
-    `/latest/dex/search?q=${encodeURIComponent(symbol)}`,
-    { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' }
-  );
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const result = await new Promise((resolve) => {
+      const url = `https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(symbol)}`;
+      const reqHeaders = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept': 'application/json',
+      };
 
-  if (!data?.pairs) {
-    log(`[SameName] No pairs returned from DexScreener for ${symbol}`);
-    return null;
+      const req = https.get(url, { headers: reqHeaders }, (res) => {
+        log(`[Dex] HTTP ${res.statusCode} for ${symbol}`);
+
+        // Manual redirect handling
+        if ([301, 302, 307, 308].includes(res.statusCode) && res.headers.location) {
+          res.resume();
+          const redirectReq = https.get(res.headers.location, { headers: reqHeaders }, (res2) => {
+            let data = '';
+            res2.on('data', c => data += c);
+            res2.on('end', () => {
+              try { resolve(JSON.parse(data)); }
+              catch { log(`[Dex] Redirect parse fail`); resolve(null); }
+            });
+          });
+          redirectReq.on('error', (e) => { log(`[Dex] Redirect error: ${e.message}`); resolve(null); });
+          redirectReq.setTimeout(15000, () => { redirectReq.destroy(); resolve(null); });
+          return;
+        }
+
+        if (res.statusCode !== 200) { res.resume(); resolve(null); return; }
+        let data = '';
+        res.on('data', c => data += c);
+        res.on('end', () => {
+          try { resolve(JSON.parse(data)); }
+          catch { log(`[Dex] Parse fail`); resolve(null); }
+        });
+      });
+      req.on('error', (e) => { log(`[Dex] Error: ${e.message}`); resolve(null); });
+      req.setTimeout(15000, () => { req.destroy(); log(`[Dex] Timeout`); resolve(null); });
+    });
+
+    if (result) {
+      const pairs   = result.pairs ?? result.data ?? [];
+      const nowSecs = Math.floor(Date.now() / 1000);
+      const cutoff  = 5 * 3600;
+
+      const matches = pairs.filter(pair => {
+        if ((pair.chainId ?? pair.chain_id) !== 'solana') return false;
+        if (pair.baseToken?.symbol?.toUpperCase() !== symbol.toUpperCase()) return false;
+        if (pair.baseToken?.address === mint) return false;
+        const createdAt = pair.pairCreatedAt ?? pair.pair_created_at;
+        if (!createdAt) return false;
+        const ageSecs = nowSecs - Math.floor(createdAt / 1000);
+        return ageSecs >= 0 && ageSecs <= cutoff;
+      });
+
+      log(`[Dex] ${symbol}: ${matches.length} other tokens in last 5h (${pairs.length} total pairs)`);
+      return matches.length;
+    }
+
+    log(`[Dex] attempt ${attempt + 1} got null for ${symbol}`);
+    if (attempt < 2) await new Promise(r => setTimeout(r, 3000));
   }
 
-  const nowSecs = Math.floor(Date.now() / 1000);
-  const cutoff  = 5 * 3600;
-
-  const matches = data.pairs.filter(pair => {
-    if (pair.chainId !== 'solana') return false;
-    if (pair.baseToken?.symbol?.toUpperCase() !== symbol.toUpperCase()) return false;
-    if (pair.baseToken?.address === mint) return false;
-    if (!pair.pairCreatedAt) return false;
-    const ageSecs = nowSecs - Math.floor(pair.pairCreatedAt / 1000);
-    return ageSecs >= 0 && ageSecs <= cutoff;
-  });
-
-  log(`[SameName] ${symbol}: ${matches.length} other tokens in last 5h (${data.pairs.length} total pairs)`);
-  return matches.length;
+  log(`[Dex] All attempts failed for ${symbol}`);
+  return null;
 }
 
 async function getTokenAge(mint) {
