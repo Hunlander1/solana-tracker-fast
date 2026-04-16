@@ -138,9 +138,14 @@ async function getCachedTokenInfo(mint) {
   if (mint in tokenInfoCache) return tokenInfoCache[mint];
   if (tokenInfoInflight[mint]) return tokenInfoInflight[mint];
   tokenInfoInflight[mint] = fetchTokenInfo(mint).then(info => {
-    tokenInfoCache[mint] = info;
+    // Only cache if we got a valid response WITH creation_timestamp.
+    // A response missing creation_timestamp is incomplete — caching it
+    // would cause the age check to pass as null on all future calls.
+    if (info && info.creation_timestamp) {
+      tokenInfoCache[mint] = info;
+      setTimeout(() => delete tokenInfoCache[mint], 600000);
+    }
     delete tokenInfoInflight[mint];
-    setTimeout(() => delete tokenInfoCache[mint], 600000);
     return info;
   });
   return tokenInfoInflight[mint];
