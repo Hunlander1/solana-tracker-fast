@@ -587,15 +587,20 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo, co
     const freshWallets = freshWalletsFromInfo ?? freshWalletsFromSecurity;
 
     if (!shouldFireSignal(tokenMint, symbol, sameNameCount, devWallet, devAthMc)) {
+      // Signal suppressed — do NOT register sell watchlist
       return;
     }
 
-    // ── UPDATE SELL WATCHLIST WITH REAL SYMBOL ────────────────
-    // Entry was already registered in handleWalletBuy with a placeholder
-    // symbol. Now that we have tokenInfo, update it with the real symbol.
-    if (coordinatedWallets && sellWatchlist[tokenMint]) {
-      sellWatchlist[tokenMint].symbol = symbol !== 'UNKNOWN' ? symbol : tokenMint.substring(0, 8);
-      log(`[SELL] Updated watchlist symbol to #${sellWatchlist[tokenMint].symbol} for ${tokenMint.substring(0, 8)}`);
+    // ── REGISTER SELL WATCHLIST ─────────────────────────────────────────────
+    // Only reached if shouldFireSignal returned true — safe to register.
+    if (coordinatedWallets && coordinatedWallets.size > 0) {
+      sellWatchlist[tokenMint] = {
+        wallets:    new Set(coordinatedWallets),
+        exited:     new Set(),
+        symbol:     symbol !== 'UNKNOWN' ? symbol : tokenMint.substring(0, 8),
+        signalTime: Math.floor(Date.now() / 1000),
+      };
+      log(`[SELL] Watching ${coordinatedWallets.size} wallets for exits on #${sellWatchlist[tokenMint].symbol} (${tokenMint.substring(0, 8)})`);
     }
 
     const signalTime = new Date().toLocaleTimeString('en-US', {
@@ -670,22 +675,9 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
 
   if (count >= 3) {
     const elapsed = now - entry.firstSeenAt;
-    // Snapshot coordinated wallets BEFORE deleting activeAlerts entry
     const coordinatedWallets = new Set(entry.wallets);
     saveFiredAlert(tokenMint);
     delete activeAlerts[tokenMint];
-
-    // ── REGISTER SELL WATCHLIST IMMEDIATELY ───────────────────
-    // Do this BEFORE the async GMGN/DexScreener calls so we don't
-    // miss sells that happen while we're waiting on API responses.
-    sellWatchlist[tokenMint] = {
-      wallets:    new Set(coordinatedWallets),
-      exited:     new Set(),
-      symbol:     tokenMint.substring(0, 8), // placeholder until tokenInfo resolves
-      signalTime: Math.floor(Date.now() / 1000),
-    };
-    log(`[SELL] Watching ${coordinatedWallets.size} wallets for exits on ${tokenMint.substring(0, 8)} (registering early)`);
-
     const tokenInfo = await getCachedTokenInfo(tokenMint);
     await buildAndSendSignal(tokenMint, count, elapsed, tokenInfo, coordinatedWallets);
   }
