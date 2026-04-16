@@ -1,6 +1,7 @@
 // ============================================================
 //  SOLANA MULTI-WALLET TRACKER — FAST BOT (60s window)
 //  Zero credits. No webhook provider. Runs forever for free.
+//  + SELL SIGNAL TRACKER — fires when all coordinated wallets exit
 // ============================================================
 
 const https   = require('https');
@@ -20,11 +21,6 @@ const MAX_TOKEN_AGE    = 60;
 const STRICT_AGE_CHECK = true;
 
 // ── SIGNAL FILTER ─────────────────────────────────────────────
-// Signal fires if AT LEAST ONE condition is true:
-//   1. Same-name count >= 10  (fires regardless of dev info)
-//   2. Dev ATH >= $1,000,000  (only if dev wallet confirmed)
-//   3. Dev wallet is a tracked wallet  (only if dev wallet confirmed)
-// If dev wallet is unknown, only condition 1 can trigger a signal.
 const SAME_NAME_THRESHOLD = 10;
 const DEV_ATH_THRESHOLD   = 1_000_000;
 
@@ -125,9 +121,16 @@ let reconnectDelay = 5000;
 let usingFallback  = false;
 let pendingSigs    = new Set();
 
+// ── SELL WATCHLIST ────────────────────────────────────────────
+// sellWatchlist[tokenMint] = {
+//   wallets: Set<walletAddress>,   — wallets that need to sell
+//   symbol: string,                — for the alert message
+//   signalTime: number,            — unix ts when buy signal fired
+//   exited: Set<walletAddress>,    — wallets confirmed fully sold
+// }
+let sellWatchlist = {};
+
 // ── UNIFIED TOKEN INFO CACHE ──────────────────────────────────
-// Guarantees at most ONE fetchTokenInfo call per mint no matter
-// how many wallets buy simultaneously — fixes 429 rate limiting.
 let tokenInfoCache    = {};
 let tokenInfoInflight = {};
 
@@ -152,6 +155,17 @@ setInterval(() => {
     if (now - activeAlerts[mint].firstSeenAt > WINDOW_SECS) delete activeAlerts[mint];
   }
 }, 60000);
+
+// Cleanup stale sell watchlist entries after 6 hours
+setInterval(() => {
+  const now = Math.floor(Date.now() / 1000);
+  for (const mint of Object.keys(sellWatchlist)) {
+    if (now - sellWatchlist[mint].signalTime > 6 * 3600) {
+      log(`[SELL] Watchlist entry for ${mint.substring(0, 8)} expired (6h) — removing`);
+      delete sellWatchlist[mint];
+    }
+  }
+}, 5 * 60 * 1000);
 
 // ── HELPERS ───────────────────────────────────────────────────
 function log(msg) {
@@ -246,6 +260,94 @@ function extractMint(tx) {
   return mint ?? null;
 }
 
+// ── SELL DETECTION ────────────────────────────────────────────
+// Returns the mint address if this tx is a full sell of a watched
+// token by the given wallet, otherwise null.
+function extractFullSell(tx, trackedWallet) {
+  const meta = tx?.meta;
+  if (!meta) return null;
+
+  const preBals  = meta.preTokenBalances  ?? [];
+  const postBals = meta.postTokenBalances ?? [];
+
+  // Find all account keys so we can match owner
+  const accountKeys = tx?.transaction?.message?.accountKeys ?? [];
+
+  for (const pre of preBals) {
+    // Must be a watched sell token
+    if (!pre.mint || pre.mint === SOL_MINT) continue;
+    if (!sellWatchlist[pre.mint]) continue;
+
+    // Check this balance entry belongs to our tracked wallet
+    const ownerOfPre = pre.owner ?? accountKeys[pre.accountIndex];
+    if (ownerOfPre !== trackedWallet) continue;
+
+    // Pre-balance must be > 0 (they held something)
+    const preAmt = parseFloat(pre.uiTokenAmount?.uiAmountString ?? '0');
+    if (preAmt <= 0) continue;
+
+    // Post-balance must be 0 (full exit)
+    const post = postBals.find(p => p.mint === pre.mint && (p.owner ?? accountKeys[p.accountIndex]) === trackedWallet);
+    const postAmt = post ? parseFloat(post.uiTokenAmount?.uiAmountString ?? '0') : 0;
+
+    if (postAmt === 0) {
+      log(`[SELL] Full exit detected: wallet ${trackedWallet.substring(0, 8)} sold all of ${pre.mint.substring(0, 8)}`);
+      return pre.mint;
+    }
+  }
+
+  return null;
+}
+
+// ── SELL SIGNAL ───────────────────────────────────────────────
+function sendSellSignal(tokenMint, entry) {
+  const elapsed = Math.floor(Date.now() / 1000) - entry.signalTime;
+  const mins    = Math.floor(elapsed / 60);
+  const secs    = elapsed % 60;
+  const elapsedStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+  const walletCount = entry.wallets.size;
+
+  const signalTime = new Date().toLocaleTimeString('en-US', {
+    timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true
+  });
+
+  sendTelegram(
+    `🚨 <b>SELL Signal — All Wallets Exited</b>\n\n` +
+    `Token: #${entry.symbol}\n` +
+    `Contract: <code>${tokenMint}</code>\n` +
+    `Wallets Exited: ${walletCount}/${walletCount}\n` +
+    `Time Since Buy Signal: ${elapsedStr}\n` +
+    `Signal Time: ${signalTime}\n\n` +
+    `<a href="https://gmgn.ai/sol/token/${tokenMint}">GMGN</a>`
+  );
+
+  log(`[SELL] 🚨 Sell signal fired for #${entry.symbol} (${tokenMint.substring(0, 8)}) | ${walletCount} wallets exited in ${elapsedStr}`);
+}
+
+// ── HANDLE SELL TX ────────────────────────────────────────────
+async function handlePotentialSell(trackedWallet, tx) {
+  const soldMint = extractFullSell(tx, trackedWallet);
+  if (!soldMint) return;
+
+  const entry = sellWatchlist[soldMint];
+  if (!entry) return;
+
+  // Only care about wallets we're watching for this token
+  if (!entry.wallets.has(trackedWallet)) return;
+
+  // Mark this wallet as exited
+  entry.exited.add(trackedWallet);
+  const remaining = entry.wallets.size - entry.exited.size;
+
+  log(`[SELL] ${trackedWallet.substring(0, 8)} exited #${entry.symbol} | ${entry.exited.size}/${entry.wallets.size} exited | ${remaining} remaining`);
+
+  // All wallets have fully sold
+  if (entry.exited.size >= entry.wallets.size) {
+    sendSellSignal(soldMint, entry);
+    delete sellWatchlist[soldMint];
+  }
+}
+
 // ── GMGN ──────────────────────────────────────────────────────
 async function gmgnGet(path, params = {}) {
   params.timestamp = Math.floor(Date.now() / 1000).toString();
@@ -274,8 +376,6 @@ async function fetchFreshWallets(mint) {
 }
 
 // ── SAME-NAME COUNT ───────────────────────────────────────────
-// Uses https.get with manual redirect handling because DexScreener
-// issues 301/302 redirects that https.request does not follow.
 async function fetchSameNameCount(mint, symbol) {
   if (!symbol || symbol === 'UNKNOWN') {
     log(`[SameName] No symbol for ${mint.substring(0, 8)} — skipping`);
@@ -295,7 +395,6 @@ async function fetchSameNameCount(mint, symbol) {
       const req = https.get(url, { headers: reqHeaders }, (res) => {
         log(`[Dex] HTTP ${res.statusCode} for ${symbol}`);
 
-        // Manual redirect handling
         if ([301, 302, 307, 308].includes(res.statusCode) && res.headers.location) {
           res.resume();
           const redirectReq = https.get(res.headers.location, { headers: reqHeaders }, (res2) => {
@@ -389,8 +488,6 @@ function sendTelegram(message) {
 }
 
 // ── SIGNAL FILTER ─────────────────────────────────────────────
-// Returns true if the signal should fire, false if it should be
-// suppressed. Logs the reason either way.
 function shouldFireSignal(tokenMint, symbol, sameNameCount, devWallet, devAthMc) {
   const devIsTracked  = devWallet && devWallet !== 'unknown' && WALLET_SET.has(devWallet);
   const devAthPasses  = devWallet && devWallet !== 'unknown' && devAthMc !== null && devAthMc >= DEV_ATH_THRESHOLD;
@@ -409,7 +506,6 @@ function shouldFireSignal(tokenMint, symbol, sameNameCount, devWallet, devAthMc)
     return true;
   }
 
-  // Log why it was suppressed
   const snStr  = sameNameCount !== null ? sameNameCount : '?';
   const athStr = devAthMc !== null ? `$${devAthMc.toLocaleString()}` : 'N/A';
   const devStr = devWallet && devWallet !== 'unknown' ? devWallet.substring(0, 8) : 'unknown';
@@ -418,7 +514,7 @@ function shouldFireSignal(tokenMint, symbol, sameNameCount, devWallet, devAthMc)
 }
 
 // ── SIGNAL ────────────────────────────────────────────────────
-async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo) {
+async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo, coordinatedWallets) {
   try {
     const now = Math.floor(Date.now() / 1000);
     let symbol = 'UNKNOWN', mintTimeStr = 'N/A', ageStr = 'N/A';
@@ -465,7 +561,6 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo) {
       if (fwStat !== undefined && fwStat !== null) freshWalletsFromInfo = fwStat;
     }
 
-    // Fetch same-name count and fresh wallets in parallel
     const [sameNameCount, freshWalletsFromSecurity] = await Promise.all([
       fetchSameNameCount(tokenMint, symbol),
       freshWalletsFromInfo === null ? fetchFreshWallets(tokenMint) : Promise.resolve(null)
@@ -473,9 +568,21 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo) {
 
     const freshWallets = freshWalletsFromInfo ?? freshWalletsFromSecurity;
 
-    // ── APPLY SIGNAL FILTER ───────────────────────────────────
     if (!shouldFireSignal(tokenMint, symbol, sameNameCount, devWallet, devAthMc)) {
-      return; // suppressed — conditions not met
+      return;
+    }
+
+    // ── REGISTER SELL WATCHLIST ───────────────────────────────
+    // Store the coordinated wallets so we can track when they all exit.
+    // coordinatedWallets is a Set passed in from handleWalletBuy.
+    if (coordinatedWallets && coordinatedWallets.size > 0) {
+      sellWatchlist[tokenMint] = {
+        wallets:    new Set(coordinatedWallets),
+        exited:     new Set(),
+        symbol:     symbol !== 'UNKNOWN' ? symbol : tokenMint.substring(0, 8),
+        signalTime: Math.floor(Date.now() / 1000),
+      };
+      log(`[SELL] Watching ${coordinatedWallets.size} wallets for exits on #${symbol} (${tokenMint.substring(0, 8)})`);
     }
 
     const signalTime = new Date().toLocaleTimeString('en-US', {
@@ -511,7 +618,6 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
     return;
   }
 
-  // Fetch and cache dev wallet — reject buy if buyer IS the dev
   if (!devWalletCache[tokenMint]) {
     const devInfo = await getCachedTokenInfo(tokenMint);
     devWalletCache[tokenMint] = devInfo?.dev?.creator_address ?? 'unknown';
@@ -551,10 +657,13 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
 
   if (count >= 3) {
     const elapsed = now - entry.firstSeenAt;
+    // Snapshot the coordinated wallets BEFORE deleting activeAlerts entry
+    const coordinatedWallets = new Set(entry.wallets);
     saveFiredAlert(tokenMint);
     delete activeAlerts[tokenMint];
     const tokenInfo = await getCachedTokenInfo(tokenMint);
-    await buildAndSendSignal(tokenMint, count, elapsed, tokenInfo);
+    // Pass coordinatedWallets into buildAndSendSignal so sell tracker can use them
+    await buildAndSendSignal(tokenMint, count, elapsed, tokenInfo, coordinatedWallets);
   }
 }
 
@@ -598,6 +707,12 @@ async function processLogNotification(params) {
     return;
   }
 
+  // ── CHECK FOR SELL FIRST (only if we have active sell watches) ──
+  if (Object.keys(sellWatchlist).length > 0) {
+    await handlePotentialSell(trackedWallet, tx);
+  }
+
+  // ── THEN CHECK FOR BUY (existing logic) ──
   const mint = extractMint(tx);
   if (!mint) {
     log(`[SKIP] No token mint in tx for ${trackedWallet.substring(0, 8)}`);
@@ -702,7 +817,8 @@ const server = http.createServer((req, res) => {
     `WS: ${wsReady ? 'connected' : 'reconnecting'}\n` +
     `Subscriptions: ${subCount}/${WALLETS.length}\n` +
     `Fired alerts: ${firedAlerts.size}\n` +
-    `Active windows: ${Object.keys(activeAlerts).length}\n`
+    `Active windows: ${Object.keys(activeAlerts).length}\n` +
+    `Sell watchlist: ${Object.keys(sellWatchlist).length} token(s)\n`
   );
 });
 
