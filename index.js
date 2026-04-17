@@ -753,6 +753,22 @@ async function processLogNotification(params) {
 
 // ── WEBSOCKET ─────────────────────────────────────────────────
 let reqIdToWallet = {};
+let lastMessageAt = Date.now();
+const WATCHDOG_MS  = 3 * 60 * 1000; // 3 minutes — force reconnect if silent
+
+// Watchdog: fires every 60s, force-reconnects if no message in 3 minutes
+setInterval(() => {
+  if (!wsReady) return;
+  const silent = Date.now() - lastMessageAt;
+  if (silent > WATCHDOG_MS) {
+    log(`[WS] Watchdog: no message for ${Math.round(silent/1000)}s — force reconnecting...`);
+    wsReady = false;
+    try { ws.terminate(); } catch(e) {}
+    usingFallback = !usingFallback; // try other endpoint on watchdog reconnect
+    reconnectDelay = 5000;
+    connect();
+  }
+}, 60000);
 
 function connect(useUrl) {
   const url = useUrl ?? (usingFallback ? WSS_FALLBACK : WSS_PRIMARY);
@@ -762,11 +778,13 @@ function connect(useUrl) {
   subIdToWallet = {};
   reqIdToWallet = {};
   wsReady = false;
+  lastMessageAt = Date.now(); // reset on new connection attempt
 
   ws.on('open', () => {
     log(`[WS] Connected — subscribing to ${WALLETS.length} wallets...`);
     wsReady = true;
     reconnectDelay = 5000;
+    lastMessageAt = Date.now();
 
     WALLETS.forEach((wallet, i) => {
       const reqId = i + 1;
@@ -793,7 +811,12 @@ function connect(useUrl) {
     }, 30000);
   });
 
+  ws.on('pong', () => {
+    lastMessageAt = Date.now(); // pong counts as activity
+  });
+
   ws.on('message', (data) => {
+    lastMessageAt = Date.now(); // reset watchdog on every message
     let msg;
     try { msg = JSON.parse(data.toString()); }
     catch { return; }
