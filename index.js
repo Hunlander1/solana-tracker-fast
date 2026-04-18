@@ -446,10 +446,9 @@ async function dexFetch(url) {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
     'Accept': 'application/json',
   };
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 0; attempt < 4; attempt++) {
     const result = await new Promise((resolve) => {
       const req = https.get(url, { headers: reqHeaders }, (res) => {
-        log(`[Dex] HTTP ${res.statusCode}`);
         if ([301, 302, 307, 308].includes(res.statusCode) && res.headers.location) {
           res.resume();
           const rr = https.get(res.headers.location, { headers: reqHeaders }, (res2) => {
@@ -461,6 +460,10 @@ async function dexFetch(url) {
           rr.setTimeout(15000, () => { rr.destroy(); resolve(null); });
           return;
         }
+        if (res.statusCode === 429) {
+          log(`[Dex] 429 rate limited on attempt ${attempt + 1}`);
+          res.resume(); resolve('RATE_LIMITED'); return;
+        }
         if (res.statusCode !== 200) { res.resume(); resolve(null); return; }
         let d = '';
         res.on('data', c => d += c);
@@ -469,15 +472,22 @@ async function dexFetch(url) {
       req.on('error', (e) => { log(`[Dex] Error: ${e.message}`); resolve(null); });
       req.setTimeout(15000, () => { req.destroy(); log(`[Dex] Timeout`); resolve(null); });
     });
+    if (result === 'RATE_LIMITED') {
+      const backoff = (attempt + 1) * 5000; // 5s, 10s, 15s
+      log(`[Dex] Backing off ${backoff/1000}s...`);
+      await new Promise(r => setTimeout(r, backoff));
+      continue;
+    }
     if (result) return result;
-    if (attempt < 2) await new Promise(r => setTimeout(r, 2000));
+    if (attempt < 3) await new Promise(r => setTimeout(r, 2000));
   }
   return null;
 }
 
 // ── SAME-NAME COUNT ────────────────────────────────────────────────────────────
-// Path 1: search by symbol. Path 2: direct mint lookup (fallback).
-// Returns 0 or more always — null only if both paths fully fail.
+// PRIMARY: direct mint lookup (more reliable, less rate limited than search).
+// FALLBACK: symbol search if mint lookup returns no pairs for this chain.
+// Returns a number always (0+) — null only if both paths completely fail.
 async function fetchSameNameCount(mint, symbol) {
   const nowSecs = Math.floor(Date.now() / 1000);
   const cutoff  = 5 * 3600;
@@ -494,39 +504,46 @@ async function fetchSameNameCount(mint, symbol) {
     }).length;
   }
 
-  // ── PATH 1: search by symbol ───────────────────────────────────────────────
-  // Pre-delay to avoid 429 rate limiting from DexScreener
+  // ── PATH 1: direct mint lookup (primary) ────────────────────────────
+  // Pre-delay to give DexScreener breathing room after GMGN calls
   await new Promise(r => setTimeout(r, 4000));
-  if (symbol && symbol !== 'UNKNOWN') {
-    log(`[Dex] Fetching same-name count by symbol for ${symbol}...`);
-    const r = await dexFetch(`https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(symbol)}`);
-    if (r) {
-      const pairs = r.pairs ?? r.data ?? [];
-      const count = countMatches(pairs, symbol, mint);
-      log(`[Dex] ${symbol}: ${count} other tokens in last 5h via symbol search (${pairs.length} total pairs)`);
+  log(`[Dex] Fetching pairs for mint ${mint.substring(0, 8)}...`);
+  const r1 = await dexFetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
+  if (r1) {
+    const pairs = r1.pairs ?? r1.data ?? [];
+    // Resolve symbol from pairs if we don't have it
+    const resolvedSymbol = (symbol && symbol !== 'UNKNOWN')
+      ? symbol
+      : (pairs.find(p => p.chainId === 'solana')?.baseToken?.symbol ?? null);
+
+    if (resolvedSymbol) {
+      const count = countMatches(pairs, resolvedSymbol, mint);
+      log(`[Dex] Mint lookup: ${resolvedSymbol} — ${count} same-name tokens in last 5h`);
       return count;
     }
-    log(`[Dex] Symbol search failed for ${symbol} — trying direct mint lookup...`);
+    // Pairs exist but no symbol resolved — token too new for DexScreener
+    log(`[Dex] Mint lookup returned pairs but no symbol for ${mint.substring(0, 8)} — returning 0`);
+    return 0;
   }
 
-  // ── PATH 2: direct lookup by mint address ─────────────────────────────
-  log(`[Dex] Fetching same-name count by mint for ${mint.substring(0, 8)}...`);
-  const r2 = await dexFetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
-  if (r2) {
-    const pairs          = r2.pairs ?? r2.data ?? [];
-    const resolvedSymbol = (symbol && symbol !== 'UNKNOWN') ? symbol : (pairs[0]?.baseToken?.symbol ?? null);
-    if (!resolvedSymbol) {
-      log(`[Dex] No symbol resolvable for ${mint.substring(0, 8)} — returning 0`);
-      return 0;
+  // ── PATH 2: symbol search fallback ───────────────────────────────────
+  if (symbol && symbol !== 'UNKNOWN') {
+    log(`[Dex] Mint lookup failed — trying symbol search for ${symbol}...`);
+    await new Promise(r => setTimeout(r, 3000));
+    const r2 = await dexFetch(`https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(symbol)}`);
+    if (r2) {
+      const pairs = r2.pairs ?? r2.data ?? [];
+      const count = countMatches(pairs, symbol, mint);
+      log(`[Dex] Symbol search: ${symbol} — ${count} same-name tokens in last 5h`);
+      return count;
     }
-    const count = countMatches(pairs, resolvedSymbol, mint);
-    log(`[Dex] ${resolvedSymbol}: ${count} other tokens in last 5h via mint lookup`);
-    return count;
   }
 
   log(`[Dex] Both paths failed for ${mint.substring(0, 8)} — returning null`);
   return null;
 }
+
+
 async function getTokenAge(mint) {
   const now = Math.floor(Date.now() / 1000);
   if (skipCache[mint]) return -1;
