@@ -20,6 +20,64 @@ const WINDOW_SECS      = 60;
 const MAX_TOKEN_AGE    = 60;
 const STRICT_AGE_CHECK = true;
 
+
+// ── NOTABLE HOLDERS ─────────────────────────────────────────────────────
+const NOTABLE_HOLDER_THRESHOLD = 50_000;
+
+async function fetchTopHolders(mint) {
+  const data = await gmgnGet('/v1/token/top_holders', {
+    chain: 'sol', address: mint, limit: '20'
+  });
+  if (!data) return [];
+  const holders = Array.isArray(data) ? data
+    : (data.holders ?? data.top_holders ?? data.data ?? []);
+  return holders;
+}
+
+async function fetchWalletValue(walletAddress) {
+  const data = await gmgnGet('/v1/wallet/info', {
+    chain: 'sol', address: walletAddress
+  });
+  if (!data) return null;
+  const val = parseFloat(
+    data.total_value ?? data.usd_value ?? data.portfolio_value ?? 0
+  );
+  return isNaN(val) ? null : val;
+}
+
+async function fetchNotableHolders(mint) {
+  try {
+    const holders = await fetchTopHolders(mint);
+    if (!holders.length) {
+      log(`[HOLDERS] No holders returned for ${mint.substring(0, 8)}`);
+      return [];
+    }
+    log(`[HOLDERS] Checking ${holders.length} top holders for ${mint.substring(0, 8)}...`);
+    const notable = [];
+    for (const holder of holders) {
+      const addr = holder.address ?? holder.wallet ?? holder.owner;
+      if (!addr) continue;
+      if (WALLET_SET.has(addr)) continue;
+      await new Promise(r => setTimeout(r, 400));
+      const value = await fetchWalletValue(addr);
+      if (value === null) continue;
+      if (value >= NOTABLE_HOLDER_THRESHOLD) {
+        const pct    = holder.percent ?? holder.percentage ?? null;
+        const pctStr = pct !== null ? ` (${parseFloat(pct).toFixed(1)}%)` : '';
+        const valStr = value >= 1_000_000
+          ? `$${(value / 1_000_000).toFixed(1)}M`
+          : `$${Math.round(value / 1000)}k`;
+        notable.push({ addr, valStr, pctStr });
+        log(`[HOLDERS] Notable: ${addr.substring(0, 8)} — ${valStr}${pctStr}`);
+      }
+    }
+    return notable;
+  } catch(e) {
+    log(`[ERR] fetchNotableHolders: ${e.message}`);
+    return [];
+  }
+}
+
 // ── SIGNAL FILTER ─────────────────────────────────────────────
 const SAME_NAME_THRESHOLD = 10;
 const DEV_ATH_THRESHOLD   = 1_000_000;
@@ -138,14 +196,9 @@ async function getCachedTokenInfo(mint) {
   if (mint in tokenInfoCache) return tokenInfoCache[mint];
   if (tokenInfoInflight[mint]) return tokenInfoInflight[mint];
   tokenInfoInflight[mint] = fetchTokenInfo(mint).then(info => {
-    // Only cache if we got a valid response WITH creation_timestamp.
-    // A response missing creation_timestamp is incomplete — caching it
-    // would cause the age check to pass as null on all future calls.
-    if (info && info.creation_timestamp) {
-      tokenInfoCache[mint] = info;
-      setTimeout(() => delete tokenInfoCache[mint], 600000);
-    }
+    tokenInfoCache[mint] = info;
     delete tokenInfoInflight[mint];
+    setTimeout(() => delete tokenInfoCache[mint], 600000);
     return info;
   });
   return tokenInfoInflight[mint];
@@ -442,6 +495,8 @@ async function fetchSameNameCount(mint, symbol) {
   }
 
   // ── PATH 1: search by symbol ───────────────────────────────────────────────
+  // Pre-delay to avoid 429 rate limiting from DexScreener
+  await new Promise(r => setTimeout(r, 2500));
   if (symbol && symbol !== 'UNKNOWN') {
     log(`[Dex] Fetching same-name count by symbol for ${symbol}...`);
     const r = await dexFetch(`https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(symbol)}`);
@@ -475,7 +530,11 @@ async function fetchSameNameCount(mint, symbol) {
 async function getTokenAge(mint) {
   const now = Math.floor(Date.now() / 1000);
   if (skipCache[mint]) return -1;
-  if (creationCache[mint]) return now - creationCache[mint];
+  if (creationCache[mint]) {
+    const age = now - creationCache[mint];
+    if (age > MAX_TOKEN_AGE) { skipCache[mint] = true; return -1; }
+    return age;
+  }
   const info = await getCachedTokenInfo(mint);
   if (!info) return null;
   const createdAt = info.creation_timestamp;
@@ -608,6 +667,16 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo, co
       log(`[SELL] Watching ${coordinatedWallets.size} wallets for exits on #${sellWatchlist[tokenMint].symbol} (${tokenMint.substring(0, 8)})`);
     }
 
+    // ── NOTABLE HOLDERS ─────────────────────────────────────────────────────
+    const notableHolders = await fetchNotableHolders(tokenMint);
+    let notableLine = '';
+    if (notableHolders.length > 0) {
+      const lines = notableHolders.map(h =>
+        `  • <code>${h.addr}</code> — ${h.valStr}${h.pctStr}`
+      );
+      notableLine = `\n\n💰 <b>Notable Holders (>$50k wallet)</b>\n` + lines.join('\n');
+    }
+
     const signalTime = new Date().toLocaleTimeString('en-US', {
       timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true
     });
@@ -626,11 +695,12 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo, co
       `Fresh Wallets: ${freshWallets !== null ? freshWallets : 'N/A'}\n` +
       `Wallets Coordinated: ${walletCount} within ${elapsed}s\n\n` +
       `Dev Wallet: ${devWalletLine}\n` +
-      `Dev ATH: ${devAth}\n\n` +
-      `Signal Time: ${signalTime}\n\n` +
+      `Dev ATH: ${devAth}` +
+      notableLine +
+      `\n\nSignal Time: ${signalTime}\n\n` +
       `<a href="https://gmgn.ai/sol/token/${tokenMint}">GMGN</a>`
     );
-    log(`[ALERT] Signal sent for #${symbol} (${tokenMint.substring(0, 8)}) | Dev ATH: ${devAth}`);
+    log(`[ALERT] Signal sent for #${symbol} (${tokenMint.substring(0, 8)}) | Dev ATH: ${devAth} | Notable: ${notableHolders.length}`);
   } catch(e) { log(`[ERR] buildAndSendSignal: ${e.message}`); }
 }
 
@@ -753,22 +823,6 @@ async function processLogNotification(params) {
 
 // ── WEBSOCKET ─────────────────────────────────────────────────
 let reqIdToWallet = {};
-let lastMessageAt = Date.now();
-const WATCHDOG_MS  = 3 * 60 * 1000; // 3 minutes — force reconnect if silent
-
-// Watchdog: fires every 60s, force-reconnects if no message in 3 minutes
-setInterval(() => {
-  if (!wsReady) return;
-  const silent = Date.now() - lastMessageAt;
-  if (silent > WATCHDOG_MS) {
-    log(`[WS] Watchdog: no message for ${Math.round(silent/1000)}s — force reconnecting...`);
-    wsReady = false;
-    try { ws.terminate(); } catch(e) {}
-    usingFallback = !usingFallback; // try other endpoint on watchdog reconnect
-    reconnectDelay = 5000;
-    connect();
-  }
-}, 60000);
 
 function connect(useUrl) {
   const url = useUrl ?? (usingFallback ? WSS_FALLBACK : WSS_PRIMARY);
@@ -778,13 +832,11 @@ function connect(useUrl) {
   subIdToWallet = {};
   reqIdToWallet = {};
   wsReady = false;
-  lastMessageAt = Date.now(); // reset on new connection attempt
 
   ws.on('open', () => {
     log(`[WS] Connected — subscribing to ${WALLETS.length} wallets...`);
     wsReady = true;
     reconnectDelay = 5000;
-    lastMessageAt = Date.now();
 
     WALLETS.forEach((wallet, i) => {
       const reqId = i + 1;
@@ -811,12 +863,7 @@ function connect(useUrl) {
     }, 30000);
   });
 
-  ws.on('pong', () => {
-    lastMessageAt = Date.now(); // pong counts as activity
-  });
-
   ws.on('message', (data) => {
-    lastMessageAt = Date.now(); // reset watchdog on every message
     let msg;
     try { msg = JSON.parse(data.toString()); }
     catch { return; }
