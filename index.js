@@ -571,27 +571,32 @@ function sendTelegram(message) {
 
 // ── SIGNAL FILTER ─────────────────────────────────────────────
 function shouldFireSignal(tokenMint, symbol, sameNameCount, devWallet, devAthMc) {
-  const devIsTracked  = devWallet && devWallet !== 'unknown' && WALLET_SET.has(devWallet);
-  const devAthPasses  = devWallet && devWallet !== 'unknown' && devAthMc !== null && devAthMc >= DEV_ATH_THRESHOLD;
+  const devIsTracked   = devWallet && devWallet !== 'unknown' && WALLET_SET.has(devWallet);
+  const devAthPasses   = devWallet && devWallet !== 'unknown' && devAthMc !== null && devAthMc >= DEV_ATH_THRESHOLD;
   const sameNamePasses = sameNameCount !== null && sameNameCount >= SAME_NAME_THRESHOLD;
+  const devPasses      = devAthPasses || devIsTracked;
 
-  if (sameNamePasses) {
-    log(`[FILTER] ✅ PASS — same-name count ${sameNameCount} >= ${SAME_NAME_THRESHOLD}`);
-    return true;
-  }
-  if (devAthPasses) {
-    log(`[FILTER] ✅ PASS — dev ATH $${devAthMc.toLocaleString()} >= $${DEV_ATH_THRESHOLD.toLocaleString()}`);
-    return true;
-  }
-  if (devIsTracked) {
-    log(`[FILTER] ✅ PASS — dev wallet ${devWallet.substring(0, 8)} is a tracked wallet`);
+  // Must have BOTH: same-name count >= 10 AND a strong dev (ATH >= $1M or dev is tracked wallet)
+  if (sameNamePasses && devPasses) {
+    const devReason = devAthPasses
+      ? `dev ATH $${devAthMc.toLocaleString()} >= $${DEV_ATH_THRESHOLD.toLocaleString()}`
+      : `dev ${devWallet.substring(0, 8)} is a tracked wallet`;
+    log(`[FILTER] ✅ PASS — same-name ${sameNameCount} >= ${SAME_NAME_THRESHOLD} AND ${devReason}`);
     return true;
   }
 
+  // Log why it was suppressed
   const snStr  = sameNameCount !== null ? sameNameCount : '?';
   const athStr = devAthMc !== null ? `$${devAthMc.toLocaleString()}` : 'N/A';
   const devStr = devWallet && devWallet !== 'unknown' ? devWallet.substring(0, 8) : 'unknown';
-  log(`[FILTER] ❌ SUPPRESSED #${symbol} — same-name: ${snStr}, dev ATH: ${athStr}, dev: ${devStr} (not tracked)`);
+
+  if (!sameNamePasses && !devPasses) {
+    log(`[FILTER] ❌ SUPPRESSED #${symbol} — same-name: ${snStr} (need >=${SAME_NAME_THRESHOLD}), dev ATH: ${athStr}, dev: ${devStr} (not tracked)`);
+  } else if (!sameNamePasses) {
+    log(`[FILTER] ❌ SUPPRESSED #${symbol} — same-name: ${snStr} (need >=${SAME_NAME_THRESHOLD}), dev would pass`);
+  } else {
+    log(`[FILTER] ❌ SUPPRESSED #${symbol} — same-name ${snStr} passes but dev ATH: ${athStr}, dev: ${devStr} (not tracked)`);
+  }
   return false;
 }
 
