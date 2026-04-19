@@ -16,7 +16,7 @@ const GMGN_API_KEY     = process.env.GMGN_API_KEY;
 const SHYFT_API_KEY    = process.env.SHYFT_API_KEY;
 
 const SOL_MINT         = 'So11111111111111111111111111111111111111112';
-const WINDOW_SECS      = 60;
+const WINDOW_SECS      = 300;
 const MAX_TOKEN_AGE    = 60;
 const STRICT_AGE_CHECK = true;
 
