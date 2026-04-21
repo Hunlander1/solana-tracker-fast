@@ -16,59 +16,85 @@ const GMGN_API_KEY     = process.env.GMGN_API_KEY;
 const SHYFT_API_KEY    = process.env.SHYFT_API_KEY;
 
 const SOL_MINT         = 'So11111111111111111111111111111111111111112';
-const WINDOW_SECS      = 300;
-const MAX_TOKEN_AGE    = 60;
+const WINDOW_SECS      = 60;
+const MAX_TOKEN_AGE    = 20;
 const STRICT_AGE_CHECK = true;
 
 
 // ── NOTABLE HOLDERS ─────────────────────────────────────────────────────
+// Uses free Solana RPC only — getTokenLargestAccounts + getBalance.
 const NOTABLE_HOLDER_THRESHOLD = 50_000;
 
-async function fetchTopHolders(mint) {
-  const data = await gmgnGet('/v1/token/top_holders', {
-    chain: 'sol', address: mint, limit: '20'
-  });
-  if (!data) return [];
-  const holders = Array.isArray(data) ? data
-    : (data.holders ?? data.top_holders ?? data.data ?? []);
-  return holders;
+let solPriceCache = { price: null, ts: 0 };
+async function getSolPrice() {
+  const now = Math.floor(Date.now() / 1000);
+  if (solPriceCache.price && now - solPriceCache.ts < 300) return solPriceCache.price;
+  const info = await getCachedTokenInfo('So11111111111111111111111111111111111111112');
+  const price = parseFloat(info?.price ?? 0);
+  if (price > 0) solPriceCache = { price, ts: now };
+  return solPriceCache.price ?? 150;
 }
 
-async function fetchWalletValue(walletAddress) {
-  const data = await gmgnGet('/v1/wallet/info', {
-    chain: 'sol', address: walletAddress
+async function getTokenAccountOwner(tokenAccountPubkey) {
+  const result = await httpsPost(HTTP_RPC, {
+    jsonrpc: '2.0', id: 1,
+    method: 'getAccountInfo',
+    params: [tokenAccountPubkey, { encoding: 'jsonParsed', commitment: 'confirmed' }]
   });
-  if (!data) return null;
-  const val = parseFloat(
-    data.total_value ?? data.usd_value ?? data.portfolio_value ?? 0
-  );
-  return isNaN(val) ? null : val;
+  return result?.result?.value?.data?.parsed?.info?.owner ?? null;
 }
 
-async function fetchNotableHolders(mint) {
+async function getWalletSolValueUsd(walletAddress, solPrice) {
+  const result = await httpsPost(HTTP_RPC, {
+    jsonrpc: '2.0', id: 1,
+    method: 'getBalance',
+    params: [walletAddress, { commitment: 'confirmed' }]
+  });
+  const lamports = result?.result?.value ?? 0;
+  return (lamports / 1e9) * solPrice;
+}
+
+async function fetchNotableHolders(mint, tokenInfo) {
   try {
-    const holders = await fetchTopHolders(mint);
-    if (!holders.length) {
-      log(`[HOLDERS] No holders returned for ${mint.substring(0, 8)}`);
-      return [];
-    }
-    log(`[HOLDERS] Checking ${holders.length} top holders for ${mint.substring(0, 8)}...`);
+    const result = await httpsPost(HTTP_RPC, {
+      jsonrpc: '2.0', id: 1,
+      method: 'getTokenLargestAccounts',
+      params: [mint, { commitment: 'confirmed' }]
+    });
+    const accounts = result?.result?.value ?? [];
+    if (!accounts.length) return [];
+
+    const solPrice    = await getSolPrice();
+    const tokenPrice  = parseFloat(tokenInfo?.price ?? 0);
+    const totalSupply = parseFloat(tokenInfo?.circulating_supply ?? tokenInfo?.total_supply ?? 0);
+
+    log(`[HOLDERS] Checking ${accounts.length} top holders for ${mint.substring(0, 8)}...`);
+
     const notable = [];
-    for (const holder of holders) {
-      const addr = holder.address ?? holder.wallet ?? holder.owner;
-      if (!addr) continue;
-      if (WALLET_SET.has(addr)) continue;
-      await new Promise(r => setTimeout(r, 400));
-      const value = await fetchWalletValue(addr);
-      if (value === null) continue;
-      if (value >= NOTABLE_HOLDER_THRESHOLD) {
-        const pct    = holder.percent ?? holder.percentage ?? null;
-        const pctStr = pct !== null ? ` (${parseFloat(pct).toFixed(1)}%)` : '';
-        const valStr = value >= 1_000_000
-          ? `$${(value / 1_000_000).toFixed(1)}M`
-          : `$${Math.round(value / 1000)}k`;
-        notable.push({ addr, valStr, pctStr });
-        log(`[HOLDERS] Notable: ${addr.substring(0, 8)} — ${valStr}${pctStr}`);
+    const seen    = new Set();
+
+    for (const account of accounts.slice(0, 20)) {
+      await new Promise(r => setTimeout(r, 200));
+      const owner = await getTokenAccountOwner(account.address);
+      if (!owner || seen.has(owner)) continue;
+      seen.add(owner);
+      if (WALLET_SET.has(owner)) continue;
+
+      const tokenAmt      = parseFloat(account.uiAmount ?? account.uiAmountString ?? 0);
+      const tokenValueUsd = tokenPrice > 0 ? tokenAmt * tokenPrice : 0;
+      const solValueUsd   = await getWalletSolValueUsd(owner, solPrice);
+      await new Promise(r => setTimeout(r, 200));
+
+      const totalValue = tokenValueUsd + solValueUsd;
+      if (totalValue >= NOTABLE_HOLDER_THRESHOLD) {
+        const pctStr = totalSupply > 0
+          ? ` (${((tokenAmt / totalSupply) * 100).toFixed(1)}%)`
+          : '';
+        const valStr = totalValue >= 1_000_000
+          ? `$${(totalValue / 1_000_000).toFixed(1)}M`
+          : `$${Math.round(totalValue / 1000)}k`;
+        notable.push({ addr: owner, valStr, pctStr });
+        log(`[HOLDERS] Notable: ${owner.substring(0, 8)} — ${valStr}${pctStr}`);
       }
     }
     return notable;
@@ -79,8 +105,7 @@ async function fetchNotableHolders(mint) {
 }
 
 // ── SIGNAL FILTER ─────────────────────────────────────────────
-const SAME_NAME_THRESHOLD = 10;
-const DEV_ATH_THRESHOLD   = 1_000_000;
+// No filter — always fire if 4+ wallets buy within 20s of mint
 
 const WSS_PRIMARY  = SHYFT_API_KEY
   ? `wss://rpc.shyft.to?api_key=${SHYFT_API_KEY}`
@@ -196,9 +221,13 @@ async function getCachedTokenInfo(mint) {
   if (mint in tokenInfoCache) return tokenInfoCache[mint];
   if (tokenInfoInflight[mint]) return tokenInfoInflight[mint];
   tokenInfoInflight[mint] = fetchTokenInfo(mint).then(info => {
-    tokenInfoCache[mint] = info;
+    // Only cache if we got a valid response WITH creation_timestamp.
+    // A response missing it is incomplete — caching would let bad data persist.
+    if (info && info.creation_timestamp) {
+      tokenInfoCache[mint] = info;
+      setTimeout(() => delete tokenInfoCache[mint], 600000);
+    }
     delete tokenInfoInflight[mint];
-    setTimeout(() => delete tokenInfoCache[mint], 600000);
     return info;
   });
   return tokenInfoInflight[mint];
@@ -441,108 +470,11 @@ async function fetchFreshWallets(mint) {
 }
 
 // ── DEXSCREENER FETCH HELPER ────────────────────────────────────────────
-async function dexFetch(url) {
-  const reqHeaders = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    'Accept': 'application/json',
-  };
-  for (let attempt = 0; attempt < 4; attempt++) {
-    const result = await new Promise((resolve) => {
-      const req = https.get(url, { headers: reqHeaders }, (res) => {
-        if ([301, 302, 307, 308].includes(res.statusCode) && res.headers.location) {
-          res.resume();
-          const rr = https.get(res.headers.location, { headers: reqHeaders }, (res2) => {
-            let d = '';
-            res2.on('data', c => d += c);
-            res2.on('end', () => { try { resolve(JSON.parse(d)); } catch { resolve(null); } });
-          });
-          rr.on('error', () => resolve(null));
-          rr.setTimeout(15000, () => { rr.destroy(); resolve(null); });
-          return;
-        }
-        if (res.statusCode === 429) {
-          log(`[Dex] 429 rate limited on attempt ${attempt + 1}`);
-          res.resume(); resolve('RATE_LIMITED'); return;
-        }
-        if (res.statusCode !== 200) { res.resume(); resolve(null); return; }
-        let d = '';
-        res.on('data', c => d += c);
-        res.on('end', () => { try { resolve(JSON.parse(d)); } catch { resolve(null); } });
-      });
-      req.on('error', (e) => { log(`[Dex] Error: ${e.message}`); resolve(null); });
-      req.setTimeout(15000, () => { req.destroy(); log(`[Dex] Timeout`); resolve(null); });
-    });
-    if (result === 'RATE_LIMITED') {
-      const backoff = (attempt + 1) * 5000; // 5s, 10s, 15s
-      log(`[Dex] Backing off ${backoff/1000}s...`);
-      await new Promise(r => setTimeout(r, backoff));
-      continue;
-    }
-    if (result) return result;
-    if (attempt < 3) await new Promise(r => setTimeout(r, 2000));
-  }
-  return null;
-}
 
 // ── SAME-NAME COUNT ────────────────────────────────────────────────────────────
 // PRIMARY: direct mint lookup (more reliable, less rate limited than search).
 // FALLBACK: symbol search if mint lookup returns no pairs for this chain.
 // Returns a number always (0+) — null only if both paths completely fail.
-async function fetchSameNameCount(mint, symbol) {
-  const nowSecs = Math.floor(Date.now() / 1000);
-  const cutoff  = 5 * 3600;
-
-  function countMatches(pairs, sym, excludeMint) {
-    return pairs.filter(pair => {
-      if ((pair.chainId ?? pair.chain_id) !== 'solana') return false;
-      if (pair.baseToken?.symbol?.toUpperCase() !== sym.toUpperCase()) return false;
-      if (pair.baseToken?.address === excludeMint) return false;
-      const createdAt = pair.pairCreatedAt ?? pair.pair_created_at;
-      if (!createdAt) return false;
-      const ageSecs = nowSecs - Math.floor(createdAt / 1000);
-      return ageSecs >= 0 && ageSecs <= cutoff;
-    }).length;
-  }
-
-  // ── PATH 1: direct mint lookup (primary) ────────────────────────────
-  // Pre-delay to give DexScreener breathing room after GMGN calls
-  await new Promise(r => setTimeout(r, 4000));
-  log(`[Dex] Fetching pairs for mint ${mint.substring(0, 8)}...`);
-  const r1 = await dexFetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
-  if (r1) {
-    const pairs = r1.pairs ?? r1.data ?? [];
-    // Resolve symbol from pairs if we don't have it
-    const resolvedSymbol = (symbol && symbol !== 'UNKNOWN')
-      ? symbol
-      : (pairs.find(p => p.chainId === 'solana')?.baseToken?.symbol ?? null);
-
-    if (resolvedSymbol) {
-      const count = countMatches(pairs, resolvedSymbol, mint);
-      log(`[Dex] Mint lookup: ${resolvedSymbol} — ${count} same-name tokens in last 5h`);
-      return count;
-    }
-    // Pairs exist but no symbol resolved — token too new for DexScreener
-    log(`[Dex] Mint lookup returned pairs but no symbol for ${mint.substring(0, 8)} — returning 0`);
-    return 0;
-  }
-
-  // ── PATH 2: symbol search fallback ───────────────────────────────────
-  if (symbol && symbol !== 'UNKNOWN') {
-    log(`[Dex] Mint lookup failed — trying symbol search for ${symbol}...`);
-    await new Promise(r => setTimeout(r, 3000));
-    const r2 = await dexFetch(`https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(symbol)}`);
-    if (r2) {
-      const pairs = r2.pairs ?? r2.data ?? [];
-      const count = countMatches(pairs, symbol, mint);
-      log(`[Dex] Symbol search: ${symbol} — ${count} same-name tokens in last 5h`);
-      return count;
-    }
-  }
-
-  log(`[Dex] Both paths failed for ${mint.substring(0, 8)} — returning null`);
-  return null;
-}
-
 
 async function getTokenAge(mint) {
   const now = Math.floor(Date.now() / 1000);
@@ -586,36 +518,6 @@ function sendTelegram(message) {
   req.end();
 }
 
-// ── SIGNAL FILTER ─────────────────────────────────────────────
-function shouldFireSignal(tokenMint, symbol, sameNameCount, devWallet, devAthMc) {
-  const devIsTracked   = devWallet && devWallet !== 'unknown' && WALLET_SET.has(devWallet);
-  const devAthPasses   = devWallet && devWallet !== 'unknown' && devAthMc !== null && devAthMc >= DEV_ATH_THRESHOLD;
-  const sameNamePasses = sameNameCount !== null && sameNameCount >= SAME_NAME_THRESHOLD;
-  const devPasses      = devAthPasses || devIsTracked;
-
-  // Must have BOTH: same-name count >= 10 AND a strong dev (ATH >= $1M or dev is tracked wallet)
-  if (sameNamePasses && devPasses) {
-    const devReason = devAthPasses
-      ? `dev ATH $${devAthMc.toLocaleString()} >= $${DEV_ATH_THRESHOLD.toLocaleString()}`
-      : `dev ${devWallet.substring(0, 8)} is a tracked wallet`;
-    log(`[FILTER] ✅ PASS — same-name ${sameNameCount} >= ${SAME_NAME_THRESHOLD} AND ${devReason}`);
-    return true;
-  }
-
-  // Log why it was suppressed
-  const snStr  = sameNameCount !== null ? sameNameCount : '?';
-  const athStr = devAthMc !== null ? `$${devAthMc.toLocaleString()}` : 'N/A';
-  const devStr = devWallet && devWallet !== 'unknown' ? devWallet.substring(0, 8) : 'unknown';
-
-  if (!sameNamePasses && !devPasses) {
-    log(`[FILTER] ❌ SUPPRESSED #${symbol} — same-name: ${snStr} (need >=${SAME_NAME_THRESHOLD}), dev ATH: ${athStr}, dev: ${devStr} (not tracked)`);
-  } else if (!sameNamePasses) {
-    log(`[FILTER] ❌ SUPPRESSED #${symbol} — same-name: ${snStr} (need >=${SAME_NAME_THRESHOLD}), dev would pass`);
-  } else {
-    log(`[FILTER] ❌ SUPPRESSED #${symbol} — same-name ${snStr} passes but dev ATH: ${athStr}, dev: ${devStr} (not tracked)`);
-  }
-  return false;
-}
 
 // ── SIGNAL ────────────────────────────────────────────────────
 async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo, coordinatedWallets) {
@@ -665,20 +567,15 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo, co
       if (fwStat !== undefined && fwStat !== null) freshWalletsFromInfo = fwStat;
     }
 
-    // Run sequentially to avoid simultaneous GMGN + DexScreener calls causing 429s
+    // Fetch fresh wallets count for display (no filter applied)
     const freshWalletsFromSecurity = freshWalletsFromInfo === null
       ? await fetchFreshWallets(tokenMint)
       : null;
-    const freshWallets  = freshWalletsFromInfo ?? freshWalletsFromSecurity;
-    const sameNameCount = await fetchSameNameCount(tokenMint, symbol);
-
-    if (!shouldFireSignal(tokenMint, symbol, sameNameCount, devWallet, devAthMc)) {
-      // Signal suppressed — do NOT register sell watchlist
-      return;
-    }
+    const freshWallets = freshWalletsFromInfo ?? freshWalletsFromSecurity;
+    // Always fire — no same-name or dev ATH filter on this bot
 
     // ── REGISTER SELL WATCHLIST ─────────────────────────────────────────────
-    // Only reached if shouldFireSignal returned true — safe to register.
+    // Register sell watchlist — signal always fires when 4+ wallets coordinate within 20s
     if (coordinatedWallets && coordinatedWallets.size > 0) {
       sellWatchlist[tokenMint] = {
         wallets:    new Set(coordinatedWallets),
@@ -690,7 +587,7 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo, co
     }
 
     // ── NOTABLE HOLDERS ─────────────────────────────────────────────────────
-    const notableHolders = await fetchNotableHolders(tokenMint);
+    const notableHolders = await fetchNotableHolders(tokenMint, tokenInfo);
     let notableLine = '';
     if (notableHolders.length > 0) {
       const lines = notableHolders.map(h =>
@@ -706,14 +603,13 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo, co
     const devWalletLine = devWallet ? `<code>${devWallet}</code>` : 'N/A';
 
     sendTelegram(
-      `⚡ <b>3-Wallet Fast Signal (60s)</b>\n\n` +
+      `⚡ <b>4-Wallet Fast Signal (20s)</b>\n\n` +
       `Token: #${symbol}\n` +
       `Contract: <code>${tokenMint}</code>\n` +
       `Mint Time: ${mintTimeStr}\n` +
       `Token Age: ${ageStr}\n` +
       `Liquidity: ${liquidityStr}\n` +
       `Market Cap: ${marketCapStr}\n` +
-      `Same-Name Count (5h): ${sameNameCount !== null ? sameNameCount : '?'}\n` +
       `Fresh Wallets: ${freshWallets !== null ? freshWallets : 'N/A'}\n` +
       `Wallets Coordinated: ${walletCount} within ${elapsed}s\n\n` +
       `Dev Wallet: ${devWalletLine}\n` +
@@ -722,7 +618,7 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo, co
       `\n\nSignal Time: ${signalTime}\n\n` +
       `<a href="https://gmgn.ai/sol/token/${tokenMint}">GMGN</a>`
     );
-    log(`[ALERT] Signal sent for #${symbol} (${tokenMint.substring(0, 8)}) | Dev ATH: ${devAth} | Notable: ${notableHolders.length}`);
+    log(`[ALERT] Signal sent for #${symbol} (${tokenMint.substring(0, 8)}) | Dev ATH: ${devAth} | Notable: ${notableHolders.length} | Wallets: ${walletCount}`);
   } catch(e) { log(`[ERR] buildAndSendSignal: ${e.message}`); }
 }
 
@@ -756,11 +652,15 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
   const now = Math.floor(Date.now() / 1000);
 
   if (!activeAlerts[tokenMint]) {
-    activeAlerts[tokenMint] = { wallets: new Set(), firstSeenAt: now };
+    // Pin window start to token mint time so all buys within 20s of mint are captured
+    const mintTs = creationCache[tokenMint] ?? now;
+    activeAlerts[tokenMint] = { wallets: new Set(), firstSeenAt: mintTs };
   }
 
   const entry = activeAlerts[tokenMint];
 
+  // Window is pinned to token mint time — all buys within 20s of mint count
+  // firstSeenAt is set to the token's creation time for accurate windowing
   if (now - entry.firstSeenAt > WINDOW_SECS) {
     log(`[RESET] ${tokenMint.substring(0, 8)} window expired — resetting`);
     activeAlerts[tokenMint] = { wallets: new Set(), firstSeenAt: now };
@@ -768,9 +668,9 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
 
   entry.wallets.add(trackedWallet);
   const count = entry.wallets.size;
-  log(`[COUNT] ${count}/3 for ${tokenMint.substring(0, 8)} within ${now - entry.firstSeenAt}s`);
+  log(`[COUNT] ${count}/4 for ${tokenMint.substring(0, 8)} within ${now - entry.firstSeenAt}s`);
 
-  if (count >= 3) {
+  if (count >= 4) {
     const elapsed = now - entry.firstSeenAt;
     const coordinatedWallets = new Set(entry.wallets);
     saveFiredAlert(tokenMint);
@@ -845,6 +745,21 @@ async function processLogNotification(params) {
 
 // ── WEBSOCKET ─────────────────────────────────────────────────
 let reqIdToWallet = {};
+let lastMessageAt = Date.now();
+const WATCHDOG_MS = 3 * 60 * 1000;
+
+setInterval(() => {
+  if (!wsReady) return;
+  const silent = Date.now() - lastMessageAt;
+  if (silent > WATCHDOG_MS) {
+    log(`[WS] Watchdog: no message for ${Math.round(silent/1000)}s — force reconnecting...`);
+    wsReady = false;
+    try { ws.terminate(); } catch(e) {}
+    usingFallback = !usingFallback;
+    reconnectDelay = 5000;
+    connect();
+  }
+}, 60000);
 
 function connect(useUrl) {
   const url = useUrl ?? (usingFallback ? WSS_FALLBACK : WSS_PRIMARY);
@@ -859,6 +774,7 @@ function connect(useUrl) {
     log(`[WS] Connected — subscribing to ${WALLETS.length} wallets...`);
     wsReady = true;
     reconnectDelay = 5000;
+    lastMessageAt = Date.now();
 
     WALLETS.forEach((wallet, i) => {
       const reqId = i + 1;
@@ -885,7 +801,10 @@ function connect(useUrl) {
     }, 30000);
   });
 
+  ws.on('pong', () => { lastMessageAt = Date.now(); });
+
   ws.on('message', (data) => {
+    lastMessageAt = Date.now();
     let msg;
     try { msg = JSON.parse(data.toString()); }
     catch { return; }
@@ -933,7 +852,7 @@ const server = http.createServer((req, res) => {
   const subCount = Object.keys(subIdToWallet).length;
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end(
-    `SOLANA FAST TRACKER (60s) — LIVE\n` +
+    `SOLANA FAST TRACKER (20s/4-wallet) — LIVE\n` +
     `WS: ${wsReady ? 'connected' : 'reconnecting'}\n` +
     `Subscriptions: ${subCount}/${WALLETS.length}\n` +
     `Fired alerts: ${firedAlerts.size}\n` +
@@ -947,7 +866,7 @@ server.listen(process.env.PORT || 3000, () => {
 });
 
 // ── START ─────────────────────────────────────────────────────
-log(`[START] Launching FAST tracker | ${WALLETS.length} wallets | 60s window | 60s max age | Active 11am-6pm ET`);
+log(`[START] Launching FAST tracker | ${WALLETS.length} wallets | 20s mint window | 4-wallet threshold | Active 11am-6pm ET`);
 log(`[START] WSS primary: ${WSS_PRIMARY.replace(/api_key=[^&]+/, 'api_key=***')}`);
 
 // ── OUTBOUND IP LOGGER ────────────────────────────────────────
