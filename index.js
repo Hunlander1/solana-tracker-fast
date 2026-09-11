@@ -258,6 +258,10 @@ const FOMO_REJECT_IDENTICAL = (process.env.FOMO_REJECT_IDENTICAL || '1') === '1'
 // exists: extractSolSpent returns the SOL the wallet actually paid, so a token
 // sent to the wallet has no spend and is not a buy. Made explicit here so the
 // rule holds even if the USD floor is set to 0.
+// Stays ON for Solana. Here the check is free and reliable: extractSolSpent
+// reads the SOL the wallet actually paid out of the transaction it already has,
+// with no extra RPC call. It is the EVM version — which needed a per-transaction
+// lookup — that was switched off after it cost six days of signals.
 const FOMO_REQUIRE_BUY = (process.env.FOMO_REQUIRE_BUY || '1') === '1';
 // Quote/base assets are never what this signal is looking for — a wallet
 // receiving wSOL or USDC has SOLD something, the opposite of an entry.
